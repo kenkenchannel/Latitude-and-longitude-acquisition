@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#1976d2">
+<title>位置記録（社内版・オフライン対応）</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; margin: 0; padding: 24px; }
+  .wrap { max-width: 560px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 16px; }
+  .card { border: 1px solid #ddd; border-radius: 16px; padding: 16px; box-shadow: 0 6px 18px rgba(0,0,0,.06); margin-top: 16px; }
+  .row { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 12px 0; }
+  label { font-size: 12px; opacity: .8; }
+  textarea { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid #ccc; font-size: 16px; }
+  button { width: 100%; padding: 14px; font-size: 16px; border-radius: 14px; border: none; cursor: pointer; box-shadow: 0 8px 26px rgba(0,0,0,.12); }
+  button.primary { background: #1976d2; color: #fff; }
+  button.secondary { background: #f1f3f5; }
+  .log { margin-top: 16px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; white-space: pre-wrap; }
+  .muted { opacity: .75; font-size: 12px; }
+  .status { display:flex; gap:8px; align-items:center; font-size:12px; }
+  .dot { width:8px; height:8px; border-radius:50%; background:#aaa; }
+  .online .dot { background:#2e7d32; }
+  .offline .dot { background:#c62828; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>位置記録（社内版）</h1>
+
+  <div class="status" id="netStatus"><span class="dot"></span><span id="netText">接続確認中…</span></div>
+
+  <!-- 記録 -->
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="note">メモ（任意）</label>
+        <textarea id="note" rows="2" placeholder="現地メモ・目印など"></textarea>
+      </div>
+    </div>
+    <div class="row">
+      <button class="primary" id="recordBtn">現在地を記録（オフライン可）</button>
+    </div>
+    <div class="log" id="log">準備OK</div>
+  </div>
+
+  <!-- 未送信キュー -->
+  <div class="card">
+    <div class="row" style="align-items:center">
+      <div class="muted">未送信の記録：<span id="pendingCount">0</span> 件</div>
+      <button class="secondary" id="flushBtn">未送信を今すぐ送る</button>
+    </div>
+    <div class="muted">オフライン時に端末内へ一時保存し、オンライン復帰時/手動で送信します。</div>
+  </div>
+
+  <p class="muted">初回起動時に位置情報の許可を「このサイトの使用中のみ許可」にしてください。</p>
+</div>
+
+<script>
+// ====== 固定設定（社内配布版）======
+// ↓↓↓ 必ず置き換え ↓↓↓
+const GAS_ENDPOINT = 'https://script.google.com/macros/s/XXXX/exec';
+const GAS_TOKEN    = 'your-long-random-token';
+// ↑↑↑ 必ず置き換え ↑↑↑
+
+// ====== PWA登録 ======
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('./sw.js').catch(console.error);
+}
+
+// ====== UIユーティリティ ======
+const el = (id) => document.getElementById(id);
+const setNet = () => {
+  const s = el('netStatus'), t = el('netText');
+  s.classList.toggle('online', navigator.onLine);
+  s.classList.toggle('offline', !navigator.onLine);
+  t.textContent = navigator.onLine ? 'オンライン' : 'オフライン';
+};
+window.addEventListener('online',  setNet);
+window.addEventListener('offline', setNet);
+setNet();
+
+const log = (m) => el('log').textContent = m;
+
+function deviceName(){
+  try {
+    const ua = navigator.userAgent;
+    const m = ua.match(/Android [^;]+; ([^)]+)\)/);
+    if (m && m[1]) return m[1].trim();
+  } catch (_) {}
+  return /iPhone|iPad|iPod/.test(navigator.userAgent) ? 'iOS-WebButton' : 'WebButton';
+}
+
+// ====== IndexedDB（未送信キュー）======
+let db;
+function openDB(){
+  return new Promise((resolve,reject)=>{
+    const req = indexedDB.open('loclog', 1);
+    req.onupgradeneeded = (e)=>{
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('pending')) {
+        db.createObjectStore('pending', { keyPath:'id', autoIncrement:true });
+      }
+    };
+    req.onsuccess = ()=>{ db = req.result; resolve(db); };
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function addPending(record){
+  if (!db) await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('pending','readwrite');
+    tx.objectStore('pending').add(record);
+    tx.oncomplete = resolve;
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function getAllPending(){
+  if (!db) await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('pending','readonly');
+    const req = tx.objectStore('pending').getAll();
+    req.onsuccess = ()=>resolve(req.result || []);
+    req.onerror = ()=>reject(req.error);
+  });
+}
+async function deletePending(id){
+  if (!db) await openDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction('pending','readwrite');
+    tx.objectStore('pending').delete(id);
+    tx.oncomplete = resolve;
+    tx.onerror = ()=>reject(tx.error);
+  });
+}
+async function refreshPendingCount(){
+  const list = await getAllPending();
+  el('pendingCount').textContent = list.length;
+  return list;
+}
+
+// ====== 送信処理 ======
+function buildBody(params){ return new URLSearchParams(params); }
+async function sendOne(payload){
+  const res = await fetch(GAS_ENDPOINT, {
+    method:'POST',
+    headers:{'Content-Type':'application/x-www-form-urlencoded;charset=UTF-8'},
+    body: buildBody(payload)
+  });
+  if (!res.ok) throw new Error('HTTP '+res.status);
+  return res.text();
+}
+async function flushPending(){
+  if (!GAS_ENDPOINT || !GAS_TOKEN){ log('設定エラー：GAS_ENDPOINT/TOKEN を埋め込んでください。'); return; }
+  const list = await refreshPendingCount();
+  if (!list.length){ log('未送信はありません。'); return; }
+  let ok=0, ng=0;
+  for (const rec of list){
+    try { await sendOne(rec.body); await deletePending(rec.id); ok++; }
+    catch(e){ ng++; }
+  }
+  await refreshPendingCount();
+  log(`未送信を送信：成功 ${ok} / 失敗 ${ng}`);
+}
+
+// ====== 記録ボタン ======
+async function recordPosition(){
+  if (!GAS_ENDPOINT || !GAS_TOKEN){ log('設定エラー：GAS_ENDPOINT/TOKEN を埋め込んでください。'); return; }
+  if (!navigator.geolocation){ log('このブラウザは位置情報に非対応です。'); return; }
+
+  log('位置情報を取得中…');
+  navigator.geolocation.getCurrentPosition(async pos=>{
+    const lat = pos.coords.latitude;
+    const lng = pos.coords.longitude;
+    const acc = pos.coords.accuracy;
+    const note = el('note').value.trim();
+    const payload = { token: GAS_TOKEN, lat, lng, acc, note, dev: deviceName(), ts: Date.now() };
+
+    if (navigator.onLine){
+      try{
+        const text = await sendOne(payload);
+        try { log('送信完了：\n' + JSON.stringify(JSON.parse(text), null, 2)); }
+        catch { log('送信完了：' + text); }
+        el('note').value = '';
+        await refreshPendingCount();
+        return;
+      }catch(e){
+        // 失敗時はキューに積む
+      }
+    }
+    await addPending({ body: payload, createdAt: Date.now() });
+    await refreshPendingCount();
+    log('オフラインのため未送信キューに保存しました。オンライン復帰時/「未送信を今すぐ送る」で送信します。');
+    el('note').value = '';
+  }, err=>{
+    log('位置取得エラー：' + err.message + '\n権限設定（位置情報）をご確認ください。');
+  }, { enableHighAccuracy:true, timeout:20000, maximumAge:0 });
+}
+
+// ====== 起動時・オンライン復帰時処理 ======
+window.addEventListener('DOMContentLoaded', async ()=>{
+  await openDB();
+  await refreshPendingCount();
+  if (navigator.onLine) flushPending();
+  el('recordBtn').addEventListener('click', recordPosition);
+  el('flushBtn').addEventListener('click', flushPending);
+});
+window.addEventListener('online', ()=> flushPending());
+</script>
+</body>
+</html>
